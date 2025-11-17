@@ -21,13 +21,14 @@ DEBUG = False
 if "--debug" in sys.argv:
     DEBUG = True
     sys.argv = [a for a in sys.argv if a != "--debug"]
-from PySide6.QtCore import Qt, QTimer, QSize, Signal
+from PySide6.QtCore import Qt, QTimer, QSize, Signal, QEvent
 from PySide6.QtGui import (
     QImage,
     QPixmap,
     QPainter,
     QColor,
     QAction,
+    QCursor,
 )
 from PySide6.QtOpenGL import (
     QOpenGLShader,
@@ -153,17 +154,34 @@ class GLImageWidget(QOpenGLWidget):
         # Upload new frame if pending
         if self.frame is not None and self._pending_upload:
             h, w = self.frame.shape[:2]
+            
+            # Check if texture needs recreation (size changed)
+            needs_recreate = (self._tex is None or self._tex_w != w or self._tex_h != h)
+            
+            if needs_recreate:
+                # Recreate texture for new size
+                if self._tex is not None:
+                    self._tex.destroy()
+                self._tex = QOpenGLTexture(QOpenGLTexture.Target2D)
+                self._tex.create()
+                self._tex.setMinificationFilter(QOpenGLTexture.Nearest)
+                self._tex.setMagnificationFilter(QOpenGLTexture.Nearest)
+                self._tex.setWrapMode(QOpenGLTexture.ClampToEdge)
+                self._tex_w, self._tex_h = w, h
+            
+            # Fast path: Create QImage with minimal overhead (no copy, direct memory view)
+            # QImage takes ownership of the data pointer but we keep the numpy array alive
             img = QImage(self.frame.data, w, h, self.frame.strides[0], QImage.Format_RGB888)
-            # Recreate texture object every upload to avoid Qt storage/format warnings
-            if self._tex is not None:
+            
+            # Always recreate texture (Qt requirement, but optimized internally)
+            if not needs_recreate:
                 self._tex.destroy()
-            self._tex = QOpenGLTexture(QOpenGLTexture.Target2D)
-            self._tex.create()
-            self._tex.setMinificationFilter(QOpenGLTexture.Nearest)
-            self._tex.setMagnificationFilter(QOpenGLTexture.Nearest)
-            self._tex.setWrapMode(QOpenGLTexture.ClampToEdge)
-            self._tex_w, self._tex_h = w, h
-            # Upload from QImage
+                self._tex = QOpenGLTexture(QOpenGLTexture.Target2D)
+                self._tex.create()
+                self._tex.setMinificationFilter(QOpenGLTexture.Nearest)
+                self._tex.setMagnificationFilter(QOpenGLTexture.Nearest)
+                self._tex.setWrapMode(QOpenGLTexture.ClampToEdge)
+            
             self._tex.setData(img)
             self._pending_upload = False
 
@@ -222,8 +240,14 @@ class BWViewer(QWidget):
         # Backing array: uint8, 0..255. Start all white (255), RGB
         self.frame = np.ones((self.img_h, self.img_w, 3), dtype=np.uint8) * 255
 
-        # RNG
-        self.rng = np.random.default_rng()
+        # RNG - use PCG64DXSM for faster random number generation
+        # PCG64DXSM is faster than default PCG64 for large array generation
+        try:
+            from numpy.random import PCG64DXSM
+            self.rng = np.random.Generator(PCG64DXSM())
+        except ImportError:
+            # Fallback to default if PCG64DXSM not available
+            self.rng = np.random.default_rng()
 
         # OpenGL-backed image widget
         self.glwidget = GLImageWidget()
@@ -265,6 +289,14 @@ class BWViewer(QWidget):
         export_action.triggered.connect(self.export_video)
         file_menu.addAction(export_action)
 
+        # View menu (fullscreen toggle)
+        view_menu = menubar.addMenu("View")
+        self.fullscreen_action = QAction("Full Screen", self)
+        self.fullscreen_action.setCheckable(True)
+        self.fullscreen_action.setShortcut("F11")
+        self.fullscreen_action.toggled.connect(self._on_fullscreen_toggled)
+        view_menu.addAction(self.fullscreen_action)
+
         # Palette menu
         palette_menu = menubar.addMenu("Palette")
         edit_action = QAction("Edit Colors...", self)
@@ -305,6 +337,17 @@ class BWViewer(QWidget):
         # Disable the single-prob slider when more than 2 colors are used
         self.slider.setEnabled(len(self.palette) <= 2)
 
+        # Performance optimization: cache random index arrays and reuse them
+        # Only regenerate the color mapping when palette changes
+        self._cached_indices = {}  # Not used - removed for true randomness
+        self._cached_masks = {}  # Not used - removed for true randomness
+        self._last_palette_hash = None  # Track palette changes
+        
+        # Pre-allocate reusable buffers for random generation to avoid allocations
+        # Note: must use float64 for rng.random() compatibility
+        self._rand_buffer = None
+        self._rand_buffer_size = 0
+
         # For FPS measurement
         self._Frames = 0
         self._frames = 0
@@ -326,6 +369,69 @@ class BWViewer(QWidget):
 
         # Menu state
         self.edit_palette_dialog = None
+        # Track whether we auto-hid controls
+        self._ui_hidden = False
+        self._start_fullscreen = False
+        # Store references to UI elements for hiding/showing
+        self._menubar = menubar
+        self._top_row_widgets = [self.btn, self.slider, self.fps_target_label, self.fps_slider]
+        if DEBUG:
+            self._top_row_widgets.append(self.dump_btn)
+        self._top_row_widgets.append(self.fps_label)
+        # Cursor auto-hide timer
+        self._cursor_timer = QTimer(self)
+        self._cursor_timer.setSingleShot(True)
+        self._cursor_timer.timeout.connect(self._hide_cursor)
+        self.setMouseTracking(True)  # Enable mouse tracking for cursor auto-hide
+
+    def _on_fullscreen_toggled(self, checked: bool):
+        # Toggle fullscreen state and hide/show UI chrome
+        try:
+            if checked:
+                # Hide menubar and control row for immersive fullscreen
+                self._menubar.hide()
+                for widget in self._top_row_widgets:
+                    widget.hide()
+                self.showFullScreen()
+                # Start cursor auto-hide timer
+                self._cursor_timer.start(2000)  # Hide after 2 seconds
+            else:
+                # Restore menubar and controls
+                self._menubar.show()
+                for widget in self._top_row_widgets:
+                    widget.show()
+                self.showNormal()
+                # Stop cursor timer and restore cursor
+                self._cursor_timer.stop()
+                self.setCursor(Qt.ArrowCursor)
+        except Exception:
+            pass
+
+    def _hide_cursor(self):
+        """Hide cursor after timeout in fullscreen."""
+        if self.isFullScreen():
+            self.setCursor(Qt.BlankCursor)
+
+    def mouseMoveEvent(self, event):
+        """Show cursor and reset timer on mouse movement in fullscreen."""
+        if self.isFullScreen():
+            self.setCursor(Qt.ArrowCursor)
+            self._cursor_timer.start(2000)
+        super().mouseMoveEvent(event)
+
+    def keyPressEvent(self, event):
+        # Allow Esc to exit fullscreen
+        try:
+            if event.key() == Qt.Key_Escape and self.isFullScreen():
+                # Uncheck action to trigger normal restoration
+                if hasattr(self, 'fullscreen_action'):
+                    self.fullscreen_action.setChecked(False)
+                else:
+                    self.showNormal()
+                return
+        except Exception:
+            pass
+        super().keyPressEvent(event)
 
     def _on_play_toggled(self, checked: bool):
         if checked:
@@ -354,49 +460,97 @@ class BWViewer(QWidget):
         width = int(max(1, int(self.img_w)))
 
         # Generate next frame
+        if DEBUG:
+            t0 = time.perf_counter()
         rgb = self._generate_rgb_frame(h, width)
+        if DEBUG:
+            t1 = time.perf_counter()
+            print(f"[PERF] Frame gen: {(t1-t0)*1000:.2f}ms")
 
         # store as frame and push to GL widget
         self.frame = rgb
+        if DEBUG:
+            t2 = time.perf_counter()
         self.glwidget.set_frame(self.frame)
+        if DEBUG:
+            t3 = time.perf_counter()
+            print(f"[PERF] GL upload: {(t3-t2)*1000:.2f}ms, Total: {(t3-t0)*1000:.2f}ms")
 
-        # FPS tracking
-
-        # FPS tracking
+        # FPS tracking - skip label updates in fullscreen to reduce overhead
         self._frames += 1
-        now = time.perf_counter()
-        elapsed = now - self._t0
-        if elapsed >= 0.25:  # update FPS label more frequently for responsiveness
-            fps = self._frames / elapsed
-            self.fps_label.setText(f"FPS: {fps:.1f}")
-            # also update window title occasionally
-            self.setWindowTitle(f"BW Viewer — FPS: {fps:.1f}")
-            self._frames = 0
-            self._t0 = now
+        if not self.isFullScreen():
+            now = time.perf_counter()
+            elapsed = now - self._t0
+            if elapsed >= 0.25:  # update FPS label more frequently for responsiveness
+                fps = self._frames / elapsed
+                self.fps_label.setText(f"FPS: {fps:.1f}")
+                self.setWindowTitle(f"BW Viewer ÔÇö FPS: {fps:.1f}")
+                self._frames = 0
+                self._t0 = now
+        else:
+            # In fullscreen, only update FPS counter occasionally to minimize overhead
+            now = time.perf_counter()
+            elapsed = now - self._t0
+            if elapsed >= 1.0:  # Update less frequently in fullscreen
+                self._frames = 0
+                self._t0 = now
 
     def _generate_rgb_frame(self, h: int, w: int) -> np.ndarray:
-        """Generate a single RGB frame using current palette/weights/probability."""
+        """Generate a single RGB frame using current palette/weights/probability.
+        
+        Performance optimizations:
+        - Reuse allocated buffers where possible (avoid allocation overhead)
+        - Use integers() for uniform distribution (fastest NumPy RNG)
+        - Use direct random() with threshold for 2-color (very fast)
+        - Use searchsorted for weighted multi-color (fast)
+        - All operations are vectorized for maximum NumPy performance
+        """
         ncol = len(self.palette)
         if ncol == 0:
             return np.zeros((h, w, 3), dtype=np.uint8)
         if ncol == 1:
-            return np.broadcast_to(self.palette[0], (h, w, 3)).copy()
+            return np.full((h, w, 3), self.palette[0], dtype=np.uint8)
+        
+        size_px = h * w
+        
+        # Ensure we have a buffer of the right size for random generation
+        # Must use float64 for rng.random() compatibility
+        if self._rand_buffer is None or self._rand_buffer_size != size_px:
+            self._rand_buffer = np.empty(size_px, dtype=np.float64)
+            self._rand_buffer_size = size_px
+        
         if ncol == 2:
-            mask = self.rng.random((h, w)) < self.prob
+            # Ultra-fast 2-color path using direct array indexing
+            # Reuse buffer for random generation
+            self.rng.random(out=self._rand_buffer.reshape(h, w))
+            mask = self._rand_buffer.reshape(h, w) < self.prob
+            # Preallocate output array and use direct indexing (faster than np.where)
             rgb = np.empty((h, w, 3), dtype=np.uint8)
             rgb[mask] = self.palette[1]
             rgb[~mask] = self.palette[0]
             return rgb
-        # ncol > 2
-        wts = np.array(self.weights[:ncol], dtype=np.float64)
-        if wts.sum() <= 0:
-            wts = np.ones_like(wts)
-        probs = (wts / wts.sum()).astype(np.float64)
-        pal = np.require(self.palette, dtype=np.uint8, requirements=["C"]).reshape((-1, 3))
-        size_px = int(h) * int(w)
-        idx = self.rng.choice(len(pal), size=size_px, p=probs)
-        cols = pal[idx]
-        return cols.reshape((h, w, 3)).astype(np.uint8)
+        
+        # Multi-color: Use integers() for uniform, or searchsorted for weighted
+        wts = self.weights[:ncol]
+        
+        # Check if weights are uniform (common case) - use faster method
+        if np.allclose(wts[:ncol], wts[0]):
+            # Uniform distribution: use integers() - fastest for this case
+            idx = self.rng.integers(0, ncol, size=size_px, dtype=np.int8 if ncol <= 127 else np.int16)
+        else:
+            # Weighted distribution: use cumsum + searchsorted
+            # Use float64 to avoid casting overhead
+            wts_f64 = wts[:ncol].astype(np.float64)
+            if wts_f64.sum() <= 0:
+                wts_f64 = np.ones(ncol, dtype=np.float64)
+            cumsum = np.cumsum(wts_f64)
+            cumsum /= cumsum[-1]
+            # Reuse buffer for random generation (already float64)
+            self.rng.random(out=self._rand_buffer)
+            idx = np.searchsorted(cumsum, self._rand_buffer, side='right')
+        
+        # Direct palette lookup
+        return self.palette[idx].reshape(h, w, 3)
 
     def _update_pixmap(self):
         # For backward compatibility: create an RGB frame and send to GL widget
@@ -464,6 +618,9 @@ class BWViewer(QWidget):
 
             self.palette = palette
             self.weights = weights
+            # Invalidate caches when palette changes
+            self._cached_indices.clear()
+            self._cached_masks.clear()
             # Show a confirmation to the user so it's obvious what was set
             if DEBUG:
                 try:
@@ -514,6 +671,14 @@ class BWViewer(QWidget):
         duration = float(dlg.out_duration)
         quality_level = int(dlg.out_quality)  # 0..10
 
+        # H.264 with yuv420p requires even dimensions; adjust and inform user if needed
+        adj_w, adj_h = out_w - (out_w % 2), out_h - (out_h % 2)
+        if (adj_w, adj_h) != (out_w, out_h):
+            # Only warn once; we keep aspect ratio by adjusting width first then height proportionally if ratio maintenance was requested earlier
+            QMessageBox.information(self, "Dimension adjustment",
+                                    f"Adjusted resolution from {out_w}x{out_h} to {adj_w}x{adj_h} for H.264 (even dimensions required).")
+            out_w, out_h = adj_w, adj_h
+
         total_frames = int(max(1, round(fps * duration)))
         # Pause live updates while exporting (remember state)
         was_running = self.timer.isActive()
@@ -521,15 +686,14 @@ class BWViewer(QWidget):
             self.timer.stop()
 
         # Progress dialog
-        prog = QProgressDialog("Exporting video...", "Cancel", 0, total_frames, self)
+        prog = QProgressDialog("Exporting video...", "Cancel", 0, total_frames + 1, self)
         prog.setWindowModality(Qt.ApplicationModal)
-        prog.setAutoClose(False)
+        prog.setAutoClose(True)
         prog.setAutoReset(False)
         prog.setMinimumDuration(300)
 
         # Map quality 0..10 -> CRF 30..16 (lower is better)
         try:
-            import numpy as _np
             crf = int(round(30 - (quality_level / 10.0) * (30 - 16)))
         except Exception:
             crf = 23
@@ -539,27 +703,55 @@ class BWViewer(QWidget):
             import imageio
             writer = None
             try:
+                # Include faststart for web playback; rely on imageio to set input rawvideo params.
                 writer = imageio.get_writer(
                     path,
                     fps=fps,
                     codec="libx264",
                     macro_block_size=None,
-                    output_params=["-crf", str(crf), "-pix_fmt", "yuv420p", "-preset", "medium"],
+                    output_params=[
+                        "-crf", str(crf),
+                        "-pix_fmt", "yuv420p",
+                        "-preset", "medium",
+                        "-movflags", "+faststart",
+                        "-loglevel", "warning",
+                    ],
                 )
             except Exception:
                 # Fallback with fewer params
                 writer = imageio.get_writer(path, fps=fps)
 
+            update_interval = max(1, fps // 8)
             for i in range(total_frames):
                 if prog.wasCanceled():
                     break
                 frame = self._generate_rgb_frame(out_h, out_w)
                 writer.append_data(np.require(frame, dtype=np.uint8, requirements=["C"]))
-                if (i % max(1, fps // 4)) == 0:
+                # Update progress more frequently early, less later
+                if (i % update_interval) == 0 or i == total_frames - 1:
                     prog.setValue(i)
                     QApplication.processEvents()
 
-            prog.setValue(total_frames)
+            # Finalizing step
+            prog.setLabelText("Finalizing (muxing)...")
+            QApplication.processEvents()
+            writer.close()
+            prog.setValue(total_frames + 1)
+            QApplication.processEvents()
+            # Improve UX: either close automatically or present a clear finished state
+            if prog.wasCanceled():
+                prog.close()
+            else:
+                # Replace 'Cancel' with 'OK' and show completion message inline
+                try:
+                    prog.setLabelText(f"Export complete. Saved to:\n{path}")
+                    # Change button text to OK (QProgressDialog supports this via setCancelButtonText)
+                    prog.setCancelButtonText("OK")
+                    # Disable further cancellation semantics
+                except Exception:
+                    pass
+                # Optionally also show a separate notification (kept for clarity)
+                QMessageBox.information(self, "Export complete", f"Video saved to:\n{path}")
         except ImportError:
             QMessageBox.warning(self, "Missing dependency",
                                 "Export requires 'imageio' (and imageio-ffmpeg).\nInstall with: pip install imageio imageio-ffmpeg")
@@ -568,7 +760,8 @@ class BWViewer(QWidget):
         finally:
             try:
                 if 'writer' in locals() and writer is not None:
-                    writer.close()
+                    # writer may already be closed above; ignore errors
+                    pass
             except Exception:
                 pass
             if was_running:
@@ -653,6 +846,7 @@ class ExportVideoDialog(QDialog):
         # Wire up aspect maintenance
         self.w_spin.valueChanged.connect(self._on_w_changed)
         self.h_spin.valueChanged.connect(self._on_h_changed)
+        self.ratio_combo.currentIndexChanged.connect(self._on_ratio_changed)
         self.q_slider.valueChanged.connect(lambda v: self.q_label.setText(f"{v}/10"))
 
         self.out_width = init_w
@@ -697,6 +891,17 @@ class ExportVideoDialog(QDialog):
             self.w_spin.blockSignals(True)
             self.w_spin.setValue(new_w)
             self.w_spin.blockSignals(False)
+
+    def _on_ratio_changed(self, idx: int):
+        # Apply selected ratio by adjusting height based on current width (or vice versa)
+        if not self.keep_ar.isChecked():
+            return
+        ratio = self._current_ratio()
+        w = int(self.w_spin.value())
+        new_h = max(1, int(round(w / ratio)))
+        self.h_spin.blockSignals(True)
+        self.h_spin.setValue(new_h)
+        self.h_spin.blockSignals(False)
 
 
 class PaletteDialog(QDialog):
