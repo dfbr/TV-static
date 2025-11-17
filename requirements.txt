@@ -1,2 +1,8 @@
-PySide6>=6.2
-numpy>=1.24
+PySide6>=6.7.0
+numpy>=1.26.0
+
+# Video export dependencies
+imageio>=2.34.0
+imageio-ffmpeg>=0.4.9
+
+# (Optional) If codecs fail, install/upgrade system ffmpeg.

@@ -52,6 +52,12 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QGridLayout,
     QMessageBox,
+    QFileDialog,
+    QSpinBox,
+    QDoubleSpinBox,
+    QCheckBox,
+    QComboBox,
+    QProgressDialog,
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
@@ -253,6 +259,13 @@ class BWViewer(QWidget):
 
         # Menu bar
         menubar = QMenuBar()
+        # File menu
+        file_menu = menubar.addMenu("File")
+        export_action = QAction("Export Video...", self)
+        export_action.triggered.connect(self.export_video)
+        file_menu.addAction(export_action)
+
+        # Palette menu
         palette_menu = menubar.addMenu("Palette")
         edit_action = QAction("Edit Colors...", self)
         palette_menu.addAction(edit_action)
@@ -339,33 +352,9 @@ class BWViewer(QWidget):
         # Determine current drawable dimensions
         h = int(max(1, int(self.img_h)))
         width = int(max(1, int(self.img_w)))
-        size_px = int(h) * int(width)
 
-        # Update frame based on current palette
-        ncol = len(self.palette)
-        if ncol == 0:
-            # black
-            rgb = np.zeros((h, width, 3), dtype=np.uint8)
-        elif ncol == 1:
-            rgb = np.broadcast_to(self.palette[0], (h, width, 3)).copy()
-        elif ncol == 2:
-            # use single probability slider (self.prob) to pick palette[1] with prob, else palette[0]
-            mask = self.rng.random((h, width)) < self.prob
-            rgb = np.empty((h, width, 3), dtype=np.uint8)
-            rgb[mask] = self.palette[1]
-            rgb[~mask] = self.palette[0]
-        else:
-            # Use weights to pick a color per pixel (use RNG.choice for clarity)
-            wts = np.array(self.weights[:ncol], dtype=np.float64)
-            if wts.sum() <= 0:
-                wts = np.ones_like(wts)
-            probs = (wts / wts.sum()).astype(np.float64)
-            # Ensure palette is an array with shape (ncol,3)
-            pal = np.require(self.palette, dtype=np.uint8, requirements=["C"]).reshape((-1, 3))
-            # Draw indices for each pixel according to probs
-            idx = self.rng.choice(len(pal), size=size_px, p=probs)
-            cols = pal[idx]
-            rgb = cols.reshape((h, width, 3)).astype(np.uint8)
+        # Generate next frame
+        rgb = self._generate_rgb_frame(h, width)
 
         # store as frame and push to GL widget
         self.frame = rgb
@@ -384,6 +373,30 @@ class BWViewer(QWidget):
             self.setWindowTitle(f"BW Viewer — FPS: {fps:.1f}")
             self._frames = 0
             self._t0 = now
+
+    def _generate_rgb_frame(self, h: int, w: int) -> np.ndarray:
+        """Generate a single RGB frame using current palette/weights/probability."""
+        ncol = len(self.palette)
+        if ncol == 0:
+            return np.zeros((h, w, 3), dtype=np.uint8)
+        if ncol == 1:
+            return np.broadcast_to(self.palette[0], (h, w, 3)).copy()
+        if ncol == 2:
+            mask = self.rng.random((h, w)) < self.prob
+            rgb = np.empty((h, w, 3), dtype=np.uint8)
+            rgb[mask] = self.palette[1]
+            rgb[~mask] = self.palette[0]
+            return rgb
+        # ncol > 2
+        wts = np.array(self.weights[:ncol], dtype=np.float64)
+        if wts.sum() <= 0:
+            wts = np.ones_like(wts)
+        probs = (wts / wts.sum()).astype(np.float64)
+        pal = np.require(self.palette, dtype=np.uint8, requirements=["C"]).reshape((-1, 3))
+        size_px = int(h) * int(w)
+        idx = self.rng.choice(len(pal), size=size_px, p=probs)
+        cols = pal[idx]
+        return cols.reshape((h, w, 3)).astype(np.uint8)
 
     def _update_pixmap(self):
         # For backward compatibility: create an RGB frame and send to GL widget
@@ -477,6 +490,213 @@ class BWViewer(QWidget):
             QMessageBox.information(self, "Palette Dump", f"Palette: {self.palette.tolist()}\nWeights: {self.weights.tolist()}")
         except Exception as e:
             QMessageBox.information(self, "Palette Dump", f"Error dumping palette: {e}")
+
+    # ---------------- Export video ----------------
+    def export_video(self):
+        """Open settings and export a video of the animated static."""
+        # Choose output file
+        default_name = "static.mp4"
+        path, sel = QFileDialog.getSaveFileName(self, "Export Video", default_name,
+                                               "MP4 Video (*.mp4);;MKV Video (*.mkv);;All Files (*.*)")
+        if not path:
+            return
+
+        # Determine initial settings
+        init_w, init_h = max(16, int(self.img_w)), max(16, int(self.img_h))
+        init_fps = max(1, int(self.fps_slider.value()))
+        dlg = ExportVideoDialog(init_w, init_h, init_fps, parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        out_w = int(dlg.out_width)
+        out_h = int(dlg.out_height)
+        fps = int(dlg.out_fps)
+        duration = float(dlg.out_duration)
+        quality_level = int(dlg.out_quality)  # 0..10
+
+        total_frames = int(max(1, round(fps * duration)))
+        # Pause live updates while exporting (remember state)
+        was_running = self.timer.isActive()
+        if was_running:
+            self.timer.stop()
+
+        # Progress dialog
+        prog = QProgressDialog("Exporting video...", "Cancel", 0, total_frames, self)
+        prog.setWindowModality(Qt.ApplicationModal)
+        prog.setAutoClose(False)
+        prog.setAutoReset(False)
+        prog.setMinimumDuration(300)
+
+        # Map quality 0..10 -> CRF 30..16 (lower is better)
+        try:
+            import numpy as _np
+            crf = int(round(30 - (quality_level / 10.0) * (30 - 16)))
+        except Exception:
+            crf = 23
+
+        # Write with imageio-ffmpeg
+        try:
+            import imageio
+            writer = None
+            try:
+                writer = imageio.get_writer(
+                    path,
+                    fps=fps,
+                    codec="libx264",
+                    macro_block_size=None,
+                    output_params=["-crf", str(crf), "-pix_fmt", "yuv420p", "-preset", "medium"],
+                )
+            except Exception:
+                # Fallback with fewer params
+                writer = imageio.get_writer(path, fps=fps)
+
+            for i in range(total_frames):
+                if prog.wasCanceled():
+                    break
+                frame = self._generate_rgb_frame(out_h, out_w)
+                writer.append_data(np.require(frame, dtype=np.uint8, requirements=["C"]))
+                if (i % max(1, fps // 4)) == 0:
+                    prog.setValue(i)
+                    QApplication.processEvents()
+
+            prog.setValue(total_frames)
+        except ImportError:
+            QMessageBox.warning(self, "Missing dependency",
+                                "Export requires 'imageio' (and imageio-ffmpeg).\nInstall with: pip install imageio imageio-ffmpeg")
+        except Exception as e:
+            QMessageBox.critical(self, "Export failed", f"An error occurred during export:\n{e}")
+        finally:
+            try:
+                if 'writer' in locals() and writer is not None:
+                    writer.close()
+            except Exception:
+                pass
+            if was_running:
+                self.timer.start()
+
+
+class ExportVideoDialog(QDialog):
+    """Simple dialog to configure video export settings."""
+    def __init__(self, init_w: int, init_h: int, init_fps: int, parent=None, default_seconds: int = 60):
+        super().__init__(parent)
+        self.setWindowTitle("Export Video")
+
+        v = QVBoxLayout(self)
+
+        # Resolution
+        res_row = QHBoxLayout()
+        res_row.addWidget(QLabel("Width:"))
+        self.w_spin = QSpinBox()
+        self.w_spin.setRange(16, 8192)
+        self.w_spin.setValue(init_w)
+        res_row.addWidget(self.w_spin)
+        res_row.addWidget(QLabel("Height:"))
+        self.h_spin = QSpinBox()
+        self.h_spin.setRange(16, 8192)
+        self.h_spin.setValue(init_h)
+        res_row.addWidget(self.h_spin)
+        v.addLayout(res_row)
+
+        # Aspect
+        aspect_row = QHBoxLayout()
+        self.keep_ar = QCheckBox("Maintain aspect ratio")
+        self.keep_ar.setChecked(True)
+        aspect_row.addWidget(self.keep_ar)
+        aspect_row.addWidget(QLabel("Ratio:"))
+        self.ratio_combo = QComboBox()
+        # Store (label, ratio_w, ratio_h)
+        self._ratios = [("Current", init_w, init_h), ("16:9", 16, 9), ("4:3", 4, 3), ("1:1", 1, 1)]
+        for label, _, _ in self._ratios:
+            self.ratio_combo.addItem(label)
+        aspect_row.addWidget(self.ratio_combo)
+        v.addLayout(aspect_row)
+
+        # FPS and duration
+        fd_row = QHBoxLayout()
+        fd_row.addWidget(QLabel("FPS:"))
+        self.fps_spin = QSpinBox()
+        self.fps_spin.setRange(1, 240)
+        self.fps_spin.setValue(init_fps)
+        fd_row.addWidget(self.fps_spin)
+        fd_row.addSpacing(16)
+        fd_row.addWidget(QLabel("Duration (s):"))
+        self.dur_spin = QDoubleSpinBox()
+        self.dur_spin.setDecimals(1)
+        self.dur_spin.setRange(1.0, 3600.0)
+        self.dur_spin.setSingleStep(1.0)
+        self.dur_spin.setValue(float(default_seconds))
+        fd_row.addWidget(self.dur_spin)
+        v.addLayout(fd_row)
+
+        # Quality
+        q_row = QHBoxLayout()
+        q_row.addWidget(QLabel("Quality:"))
+        self.q_slider = QSlider(Qt.Horizontal)
+        self.q_slider.setRange(0, 10)
+        self.q_slider.setValue(8)
+        q_row.addWidget(self.q_slider)
+        self.q_label = QLabel("8/10")
+        q_row.addWidget(self.q_label)
+        v.addLayout(q_row)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        ok = QPushButton("OK")
+        cancel = QPushButton("Cancel")
+        ok.clicked.connect(self.accept)
+        cancel.clicked.connect(self.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(ok)
+        btn_row.addWidget(cancel)
+        v.addLayout(btn_row)
+
+        # Wire up aspect maintenance
+        self.w_spin.valueChanged.connect(self._on_w_changed)
+        self.h_spin.valueChanged.connect(self._on_h_changed)
+        self.q_slider.valueChanged.connect(lambda v: self.q_label.setText(f"{v}/10"))
+
+        self.out_width = init_w
+        self.out_height = init_h
+        self.out_fps = init_fps
+        self.out_duration = float(default_seconds)
+        self.out_quality = 8
+
+    def exec(self) -> int:
+        code = super().exec()
+        if code == QDialog.Accepted:
+            self.out_width = int(self.w_spin.value())
+            self.out_height = int(self.h_spin.value())
+            self.out_fps = int(self.fps_spin.value())
+            self.out_duration = float(self.dur_spin.value())
+            self.out_quality = int(self.q_slider.value())
+        return code
+
+    def _current_ratio(self):
+        label = self.ratio_combo.currentText()
+        for l, rw, rh in self._ratios:
+            if l == label:
+                return float(rw) / float(max(1, rh))
+        return float(self.w_spin.value()) / float(max(1, self.h_spin.value()))
+
+    def _on_w_changed(self, val: int):
+        if not self.keep_ar.isChecked():
+            return
+        ratio = self._current_ratio()
+        new_h = max(1, int(round(val / ratio)))
+        if self.h_spin.value() != new_h:
+            self.h_spin.blockSignals(True)
+            self.h_spin.setValue(new_h)
+            self.h_spin.blockSignals(False)
+
+    def _on_h_changed(self, val: int):
+        if not self.keep_ar.isChecked():
+            return
+        ratio = self._current_ratio()
+        new_w = max(1, int(round(val * ratio)))
+        if self.w_spin.value() != new_w:
+            self.w_spin.blockSignals(True)
+            self.w_spin.setValue(new_w)
+            self.w_spin.blockSignals(False)
 
 
 class PaletteDialog(QDialog):
