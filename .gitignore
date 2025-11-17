@@ -16,5 +16,3 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
-# Large video files
-*.mp4
