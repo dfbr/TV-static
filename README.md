@@ -4,7 +4,7 @@ A fast, interactive Python app that generates classic "analogue TV snow" (static
 
 ## Demo
 
-[![Demo video output]([https://share.gifyoutube.com/KzB6Gb.gif](https://github.com/dfbr/TV-static/raw/refs/heads/main/static.mp4))]([https://www.youtube.com/watch?v=ek1j272iAmc](https://github.com/dfbr/TV-static/raw/refs/heads/main/static.mp4))
+[![Demo video output](https://img1.picmix.com/output/stamp/normal/3/7/3/1/2541373_8690a.gif)](https://github.com/dfbr/TV-static/raw/refs/heads/main/static.mp4)
 
 ## Features
 
