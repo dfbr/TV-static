@@ -4,8 +4,10 @@ A fast, interactive Python app that generates classic "analogue TV snow" (static
 
 ## Demo
 
-https://github.com/dfbr/TV-static/raw/refs/heads/main/static.mp4
-
+<video width="600" autoplay muted loop>
+  <source src="[path/to/your/video.mp4](https://github.com/dfbr/TV-static/raw/refs/heads/main/static.mp4)" type="video/mp4">
+  Your browser does not support the video tag.
+</video>
 *Example of the static generator in action*
 
 ## Features
